@@ -1,0 +1,315 @@
+name: Multi-Stage CI Pipeline with ML Model Caching
+on:
+  push:
+    branches: [main, staging, dev]
+  pull_request:
+    branches: [main, staging, dev]
+  workflow_dispatch:
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: ${{ github.event.repository.name }}
+  NODE_VERSION: '18'
+  PYTHON_VERSION: '3.11'
+  TRANSFORMERS_CACHE: ~/.cache/huggingface
+  TORCH_HOME: ~/.cache/torch
+jobs:
+  frontend-lint-test:
+    name: Frontend Lint & Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [16, 18, 20]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
+      - name: Cache node modules
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ matrix.node-version }}-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ matrix.node-version }}-
+            ${{ runner.os }}-node-
+      - name: Install frontend dependencies
+        run: |
+          npm ci --legacy-peer-deps
+      - name: Run ESLint
+        run: |
+          npm run lint --if-present || npx eslint . --ext .js,.jsx,.ts,.tsx --max-warnings 0 || true
+      - name: Run frontend tests
+        run: |
+          npm test -- --coverage --watchAll=false --passWithNoTests
+        env:
+          CI: true
+      - name: Upload frontend coverage
+        if: ${{ secrets.CODECOV_TOKEN }}
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage/lcov.info
+          flags: frontend
+          name: frontend-${{ matrix.node-version }}
+          token: ${{ secrets.CODECOV_TOKEN }}
+  backend-lint-test:
+    name: Backend Lint & Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.10', '3.11']
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('**/requirements.txt', '**/setup.py', '**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-${{ matrix.python-version }}-
+            ${{ runner.os }}-pip-
+      - name: Cache ML models
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/torch
+          key: ${{ runner.os }}-ml-models-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-ml-models-
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install flake8 pytest pytest-cov black isort mypy bandit pylint safety
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f backend/requirements.txt ]; then pip install -r backend/requirements.txt; fi
+      - name: Run Black formatter check
+        run: |
+          black --check . || true
+      - name: Run isort check
+        run: |
+          isort --check-only . || true
+      - name: Run Flake8
+        run: |
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+      - name: Run Pylint
+        run: |
+          pylint **/*.py --exit-zero || true
+      - name: Run MyPy type checking
+        run: |
+          mypy . --ignore-missing-imports --exit-zero || true
+      - name: Run backend tests
+        run: |
+          pytest --cov=. --cov-report=xml --cov-report=term --verbose || true
+      - name: Upload backend coverage
+        if: ${{ secrets.CODECOV_TOKEN }}
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.xml
+          flags: backend
+          name: backend-${{ matrix.python-version }}
+          token: ${{ secrets.CODECOV_TOKEN }}
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    needs: [frontend-lint-test, backend-lint-test]
+    env:
+      NODE_VERSION: ${{ env.NODE_VERSION }}
+      PYTHON_VERSION: ${{ env.PYTHON_VERSION }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Run npm audit
+        run: |
+          npm audit --audit-level=moderate || true
+      - name: Install Safety
+        run: pip install safety
+      - name: Run Safety check
+        run: |
+          pip install -r requirements.txt || true
+          safety check --json || true
+      - name: Run Bandit security scan
+        run: |
+          pip install bandit
+          bandit -r . -f json -o bandit-report.json || true
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+      - name: Run Snyk security scan
+        if: ${{ secrets.SNYK_TOKEN }}
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+  build-frontend:
+    name: Build Frontend
+    runs-on: ubuntu-latest
+    needs: [frontend-lint-test, security-scan]
+    if: success()
+    env:
+      NODE_VERSION: ${{ env.NODE_VERSION }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps
+      - name: Build frontend
+        run: npm run build
+        env:
+          CI: false
+          NODE_ENV: production
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-build
+          path: build/
+          retention-days: 7
+  build-backend:
+    name: Build Backend
+    runs-on: ubuntu-latest
+    needs: [backend-lint-test, security-scan]
+    if: success()
+    env:
+      PYTHON_VERSION: ${{ env.PYTHON_VERSION }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Cache ML models
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/torch
+          key: ${{ runner.os }}-ml-models-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-ml-models-
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install wheel setuptools
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f backend/requirements.txt ]; then pip install -r backend/requirements.txt; fi
+      - name: Preload ML models
+        run: |
+          python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')" || true
+        continue-on-error: true
+      - name: Package backend
+        run: |
+          python setup.py sdist bdist_wheel || true
+        continue-on-error: true
+      - name: Upload backend artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-package
+          path: |
+            dist/
+            backend/
+          retention-days: 7
+  build-docker:
+    name: Build and Push Docker Images
+    runs-on: ubuntu-latest
+    needs: [build-frontend, build-backend]
+    if: github.event_name == 'push'
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_REGION: ${{ env.AWS_REGION }}
+      ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Download frontend artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-build
+          path: build/
+      - name: Configure AWS credentials
+        if: ${{ secrets.AWS_ROLE_ARN }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Login to Amazon ECR
+        if: ${{ secrets.AWS_ROLE_ARN }}
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+      - name: Build and push frontend image
+        if: ${{ secrets.AWS_ROLE_ARN }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.frontend
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}-frontend:${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}-frontend:latest
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max

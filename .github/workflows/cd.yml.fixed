@@ -1,0 +1,164 @@
+name: CD Pipeline - AWS EKS
+on:
+  workflow_run:
+    workflows:
+      - CI Pipeline
+    types:
+      - completed
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY_BACKEND: app-backend
+  ECR_REPOSITORY_FRONTEND: app-frontend
+  EKS_CLUSTER_NAME: app-cluster
+  SMOKE_TEST_PATH: /api/health
+jobs:
+  prepare:
+    name: Prepare Deployment
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.image_tag }}
+    steps:
+      - name: Capture image tag
+        id: tag
+        run: echo "image_tag=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+  deploy:
+    name: Deploy to ${{ matrix.environment_name }}
+    runs-on: ubuntu-latest
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - branch: dev
+            environment_name: dev
+            namespace: dev
+            cluster_suffix: -dev
+            ingress_host: dev.app.example.com
+            secret_suffix: DEV
+          - branch: staging
+            environment_name: staging
+            namespace: staging
+            cluster_suffix: -staging
+            ingress_host: staging.app.example.com
+            secret_suffix: STAGING
+          - branch: main
+            environment_name: production
+            namespace: production
+            cluster_suffix: ''
+            ingress_host: app.example.com
+            secret_suffix: PRODUCTION
+    environment:
+      name: ${{ matrix.environment_name }}
+      url: https://${{ matrix.ingress_host }}
+    steps:
+      - name: Checkout repository
+        if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == matrix.branch }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - name: Configure AWS credentials
+        if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == matrix.branch }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_ARN_{0}', matrix.secret_suffix)] }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: cdsession-${{ matrix.environment_name }}-${{ github.run_id }}
+      - name: Login to Amazon ECR
+        if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == matrix.branch }}
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Install kubectl
+        if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == matrix.branch }}
+        uses: azure/setup-kubectl@v4
+      - name: Install Helm
+        if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == matrix.branch }}
+        uses: azure/setup-helm@v4
+      - name: Configure kubectl
+        if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == matrix.branch }}
+        env:
+          CLUSTER_SUFFIX: ${{ matrix.cluster_suffix }}
+          ECR_REGISTRY: ${{ steps.ecr_registry.outputs.registry }}
+        run: |
+          CLUSTER_NAME="${{ env.EKS_CLUSTER_NAME }}"
+          if [ -n "$CLUSTER_SUFFIX" ]; then
+            CLUSTER_NAME="${CLUSTER_NAME}${CLUSTER_SUFFIX}"
+          fi
+          aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "${{ env.AWS_REGION }}"
+          echo "registry=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> "$GITHUB_OUTPUT"
+        id: ecr_registry
+      - name: Ensure namespace exists
+        if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == matrix.branch }}
+        env:
+          NAMESPACE: ${{ matrix.namespace }}
+        run: |
+          kubectl get namespace "$NAMESPACE" >/dev/null 2>&1 || \
+          kubectl create namespace "$NAMESPACE"
+      - name: Create or update Kubernetes secret
+        if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == matrix.branch }}
+        env:
+          NAMESPACE: ${{ matrix.namespace }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN_SECRET: ${{ secrets.GH_TOKEN }}
+          DB_PASSWORD: ${{ secrets[format('DB_PASSWORD_{0}', matrix.secret_suffix)] }}
+        run: |
+          kubectl create secret generic app-secrets \
+            --from-literal=anthropic-api-key="${ANTHROPIC_API_KEY:-placeholder}" \
+            --from-literal=github-token="${GITHUB_TOKEN_SECRET:-placeholder}" \
+            --from-literal=db-password="${DB_PASSWORD:-placeholder}" \
+            --namespace "$NAMESPACE" \
+            --dry-run=client -o yaml | kubectl apply -f -
+      - name: Deploy application resources
+        if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == matrix.branch }}
+        env:
+          NAMESPACE: ${{ matrix.namespace }}
+          ECR_REGISTRY: ${{ steps.ecr_registry.outputs.registry }}
+        run: |
+          if [ -d "k8s/${{ matrix.environment_name }}" ]; then
+            kubectl apply -f "k8s/${{ matrix.environment_name }}" -n "$NAMESPACE"
+          elif [ -f "helm/Chart.yaml" ]; then
+            helm upgrade --install "awesome-app-${{ matrix.environment_name }}" ./helm \
+              --namespace "$NAMESPACE" \
+              --create-namespace \
+              --set image.repository="$ECR_REGISTRY/${{ env.ECR_REPOSITORY_BACKEND }}" \
+              --set image.tag="${{ needs.prepare.outputs.image_tag }}"
+          else
+            echo "No Kubernetes manifests found; skipping apply step."
+          fi
+      - name: Update container images
+        if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == matrix.branch }}
+        env:
+          NAMESPACE: ${{ matrix.namespace }}
+          ECR_REGISTRY: ${{ steps.ecr_registry.outputs.registry }}
+        run: |
+          BACKEND_IMAGE="$ECR_REGISTRY/${{ env.ECR_REPOSITORY_BACKEND }}:${{ needs.prepare.outputs.image_tag }}"
+          FRONTEND_IMAGE="$ECR_REGISTRY/${{ env.ECR_REPOSITORY_FRONTEND }}:${{ needs.prepare.outputs.image_tag }}"
+          kubectl set image deployment/backend backend="$BACKEND_IMAGE" -n "$NAMESPACE" --record || true
+          kubectl set image deployment/frontend frontend="$FRONTEND_IMAGE" -n "$NAMESPACE" --record || true
+      - name: Wait for rollout
+        if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == matrix.branch }}
+        env:
+          NAMESPACE: ${{ matrix.namespace }}
+        run: |
+          kubectl rollout status deployment/backend -n "$NAMESPACE" --timeout=5m || true
+          kubectl rollout status deployment/frontend -n "$NAMESPACE" --timeout=5m || true
+      - name: Run smoke tests
+        if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == matrix.branch }}
+        env:
+          NAMESPACE: ${{ matrix.namespace }}
+          INGRESS_HOST: ${{ matrix.ingress_host }}
+        run: |
+          sleep 30
+          if kubectl get ingress -n "$NAMESPACE" >/dev/null 2>&1; then
+            HOST="$INGRESS_HOST"
+            if [ -z "$HOST" ] || [ "$HOST" = "app.example.com" ]; then
+              HOST=$(kubectl get ingress -n "$NAMESPACE" -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' || echo "$INGRESS_HOST")
+            fi
+            curl -fsSL "https://$HOST${{ env.SMOKE_TEST_PATH }}" || curl -fsSL "http://$HOST${{ env.SMOKE_TEST_PATH }}"
+          else
+            echo "No ingress detected; skipping smoke test."
+          fi
+      - name: Notify Slack
+        if: ${{ always() && secrets.SLACK_WEBHOOK != '' && github.event.workflow_run.head_branch == matrix.branch }}
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: Deployment ${{ job.status }} for ${{ matrix.environment_name }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}

@@ -1,0 +1,237 @@
+name: Terraform AWS Multi-Environment
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'terraform/**'
+  push:
+    branches:
+      - main
+    paths:
+      - 'terraform/**'
+  schedule:
+    - cron: '0 6 * * 1-5'
+  workflow_dispatch:
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+env:
+  TF_VERSION: '1.6.3'
+  AWS_REGION: us-east-1
+jobs:
+  fmt_validate:
+    name: Terraform fmt & validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Terraform fmt
+        working-directory: terraform
+        run: terraform fmt -check -recursive
+      - name: Terraform init (no backend)
+        working-directory: terraform
+        run: terraform init -backend=false
+      - name: Terraform validate
+        working-directory: terraform
+        run: terraform validate -no-color
+  security_scan:
+    name: Security scanning
+    runs-on: ubuntu-latest
+    needs: fmt_validate
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: terraform
+          soft_fail: false
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: terraform
+          framework: terraform
+          soft_fail: false
+  plan:
+    name: Terraform plan
+    runs-on: ubuntu-latest
+    needs: [fmt_validate, security_scan]
+    strategy:
+      matrix:
+        include:
+          - environment: dev
+            role_secret: AWS_ROLE_ARN_DEV
+          - environment: staging
+            role_secret: AWS_ROLE_ARN_STAGING
+          - environment: production
+            role_secret: AWS_ROLE_ARN_PRODUCTION
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[matrix.role_secret] }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: terraform-${{ matrix.environment }}-${{ github.run_id }}
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - name: Terraform init
+        working-directory: terraform
+        run: terraform init
+      - name: Terraform plan
+        id: plan
+        working-directory: terraform
+        run: |
+          terraform workspace select ${{ matrix.environment }} || terraform workspace new ${{ matrix.environment }}
+          set +e
+          terraform plan -var-file="environments/${{ matrix.environment }}.tfvars" -out="tfplan-${{ matrix.environment }}" -input=false -no-color > "plan-${{ matrix.environment }}.txt"
+          exit_code=$?
+          echo "exitcode=$exit_code" >> "$GITHUB_OUTPUT"
+          terraform show -no-color "tfplan-${{ matrix.environment }}" >> "plan-${{ matrix.environment }}.txt" || true
+          exit $exit_code
+        continue-on-error: true
+      - name: Fail on plan error
+        if: steps.plan.outputs.exitcode == '1'
+        run: exit 1
+      - name: Upload plan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}
+          path: |
+            terraform/tfplan-${{ matrix.environment }}
+            terraform/plan-${{ matrix.environment }}.txt
+          retention-days: 5
+      - name: Comment pull request with plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const envName = '${{ matrix.environment }}'.toUpperCase();
+            const planPath = `terraform/plan-${{ matrix.environment }}.txt`;
+            const body = fs.existsSync(planPath)
+              ? fs.readFileSync(planPath, 'utf8')
+              : 'Plan output not available.';
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## Terraform plan (${envName})\n\n\u0060\u0060\u0060terraform\n${body}\n\u0060\u0060\u0060`
+            });
+      - name: Raise drift issue
+        if: ${{ github.event_name == 'schedule' && steps.plan.outputs.exitcode == '2' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const planPath = `terraform/plan-${{ matrix.environment }}.txt`;
+            const planBody = fs.existsSync(planPath)
+              ? fs.readFileSync(planPath, 'utf8')
+              : 'Plan output not available.';
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Drift detected in ${{ matrix.environment }} environment`,
+              body: `Terraform detected drift in **${{ matrix.environment }}** environment.\n\n\u0060\u0060\u0060terraform\n${planBody}\n\u0060\u0060\u0060`,
+              labels: ['infrastructure', 'drift-detection', '${{ matrix.environment }}']
+            });
+  apply_non_production:
+    name: Apply dev/staging
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    needs: plan
+    strategy:
+      matrix:
+        include:
+          - environment: dev
+            role_secret: AWS_ROLE_ARN_DEV
+          - environment: staging
+            role_secret: AWS_ROLE_ARN_STAGING
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[matrix.role_secret] }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}
+          path: terraform
+      - name: Terraform apply
+        working-directory: terraform
+        run: |
+          terraform init
+          terraform workspace select ${{ matrix.environment }} || terraform workspace new ${{ matrix.environment }}
+          terraform apply -input=false -auto-approve tfplan-${{ matrix.environment }}
+  apply_production:
+    name: Apply production
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    needs: [plan, apply_non_production]
+    environment:
+      name: production
+      url: https://production.example.com
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PRODUCTION }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-production
+          path: terraform
+      - name: Terraform apply
+        working-directory: terraform
+        run: |
+          terraform init
+          terraform workspace select production || terraform workspace new production
+          terraform apply -input=false -auto-approve tfplan-production
+  cleanup:
+    name: Cleanup artifacts
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [plan, apply_non_production, apply_production]
+    steps:
+      - name: Delete plan artifacts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId
+            });
+            for (const artifact of artifacts.data.artifacts) {
+              if (artifact.name.startsWith('tfplan-')) {
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id
+                });
+              }
+            }
